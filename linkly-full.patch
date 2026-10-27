@@ -1,0 +1,1252 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..9901f6f
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,8 @@
++node_modules
++.next
++next-env.d.ts
++*.tsbuildinfo
++data/db.json
++data/*.tmp
++.DS_Store
++AGENTS.md
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..e7e93dc
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,47 @@
++# Linkly
++
++A tiny link shortener with click analytics, built with Next.js (App Router) and TypeScript.
++Data lives in a single JSON file (`data/db.json`), so there is nothing to set up besides Node.
++
++## Run it
++
++```bash
++npm install
++npm run seed     # creates data/db.json with demo links and click history
++npm run dev      # http://localhost:3000
++```
++
++## API
++
++| Method | Path | Body | Result |
++| :--- | :--- | :--- | :--- |
++| `GET` | `/api/links` | | `{ links: LinkRecord[] }`, newest first |
++| `POST` | `/api/links` | `{ url, slug? }` | `201 { link }` |
++| `PATCH` | `/api/links/:slug` | `{ url }` | `200 { link }` |
++| `DELETE` | `/api/links/:slug` | | `204` |
++| `GET` | `/api/stats` | | totals, clicks per day, top referrers |
++| `GET` | `/:slug` | | records a click and redirects to the destination |
++
++## Layout
++
++```
++app/[slug]/route.ts          redirect + click logging
++app/api/links/route.ts       list + create
++app/api/links/[slug]/route.ts  edit + delete
++app/api/stats/route.ts       analytics
++components/                  dashboard UI
++lib/store.ts                 JSON file storage
++lib/slug.ts                  random slug generator
++lib/stats.ts                 per-day and referrer aggregation
++scripts/                     seed, hammer, collide, stats helpers
++```
++
++## Helper scripts
++
++| Command | What it does |
++| :--- | :--- |
++| `npm run seed` | Reset `data/db.json` to the demo data |
++| `npm run hammer` | Send 50 simultaneous visits to `/docs` and check the click counter |
++| `npm run collide` | Check that creating links never overwrites an existing link |
++| `npm run stats` | Print `/api/stats` in the terminal |
++| `npm run dev:la` | Start the dev server with the timezone set to `America/Los_Angeles` |
+diff --git a/app/[slug]/route.ts b/app/[slug]/route.ts
+new file mode 100644
+index 0000000..216aa67
+--- /dev/null
++++ b/app/[slug]/route.ts
+@@ -0,0 +1,31 @@
++import { readDb, writeDb } from "@/lib/store";
++
++// GET /:slug -> record the click, then redirect to the destination.
++export async function GET(
++  req: Request,
++  { params }: { params: Promise<{ slug: string }> }
++) {
++  const { slug } = await params;
++
++  const db = await readDb();
++  const link = db.links[slug];
++  if (!link) {
++    return new Response("Link not found", { status: 404 });
++  }
++
++  link.clicks += 1;
++  db.events.push({
++    slug,
++    ts: new Date().toISOString(),
++    referrer: req.headers.get("referer"),
++  });
++  await writeDb(db);
++
++  return new Response(null, {
++    status: 301,
++    headers: {
++      Location: link.url,
++      "Cache-Control": "public, max-age=31536000",
++    },
++  });
++}
+diff --git a/app/api/links/[slug]/route.ts b/app/api/links/[slug]/route.ts
+new file mode 100644
+index 0000000..26df259
+--- /dev/null
++++ b/app/api/links/[slug]/route.ts
+@@ -0,0 +1,46 @@
++import { NextResponse } from "next/server";
++import { readDb, writeDb } from "@/lib/store";
++
++export const dynamic = "force-dynamic";
++
++// PATCH /api/links/:slug { url } -> change where a short link points.
++export async function PATCH(
++  req: Request,
++  { params }: { params: Promise<{ slug: string }> }
++) {
++  const { slug } = await params;
++  const body = (await req.json().catch(() => null)) as { url?: unknown } | null;
++
++  if (!body || typeof body.url !== "string" || body.url.trim() === "") {
++    return NextResponse.json({ error: "url is required" }, { status: 400 });
++  }
++
++  const db = await readDb();
++  const link = db.links[slug];
++  if (!link) {
++    return NextResponse.json({ error: "not found" }, { status: 404 });
++  }
++
++  link.url = body.url.trim();
++  await writeDb(db);
++
++  return NextResponse.json({ link });
++}
++
++// DELETE /api/links/:slug -> remove a link (its click history stays).
++export async function DELETE(
++  _req: Request,
++  { params }: { params: Promise<{ slug: string }> }
++) {
++  const { slug } = await params;
++
++  const db = await readDb();
++  if (!db.links[slug]) {
++    return NextResponse.json({ error: "not found" }, { status: 404 });
++  }
++
++  delete db.links[slug];
++  await writeDb(db);
++
++  return new Response(null, { status: 204 });
++}
+diff --git a/app/api/links/route.ts b/app/api/links/route.ts
+new file mode 100644
+index 0000000..23e9825
+--- /dev/null
++++ b/app/api/links/route.ts
+@@ -0,0 +1,43 @@
++import { NextResponse } from "next/server";
++import { readDb, writeDb, type LinkRecord } from "@/lib/store";
++import { generateSlug } from "@/lib/slug";
++
++export const dynamic = "force-dynamic";
++
++// GET /api/links -> every link, newest first.
++export async function GET() {
++  const db = await readDb();
++  const links = Object.values(db.links).sort((a, b) =>
++    b.createdAt.localeCompare(a.createdAt)
++  );
++  return NextResponse.json({ links });
++}
++
++// POST /api/links { url, slug? } -> create a short link.
++export async function POST(req: Request) {
++  const body = (await req.json().catch(() => null)) as {
++    url?: unknown;
++    slug?: unknown;
++  } | null;
++
++  if (!body || typeof body.url !== "string" || body.url.trim() === "") {
++    return NextResponse.json({ error: "url is required" }, { status: 400 });
++  }
++
++  const slug =
++    typeof body.slug === "string" && body.slug.trim() !== ""
++      ? body.slug.trim()
++      : generateSlug();
++
++  const db = await readDb();
++  const link: LinkRecord = {
++    slug,
++    url: body.url.trim(),
++    createdAt: new Date().toISOString(),
++    clicks: 0,
++  };
++  db.links[slug] = link;
++  await writeDb(db);
++
++  return NextResponse.json({ link }, { status: 201 });
++}
+diff --git a/app/api/stats/route.ts b/app/api/stats/route.ts
+new file mode 100644
+index 0000000..9d1eff4
+--- /dev/null
++++ b/app/api/stats/route.ts
+@@ -0,0 +1,18 @@
++import { NextResponse } from "next/server";
++import { readDb } from "@/lib/store";
++import { clicksPerDay, topReferrers } from "@/lib/stats";
++
++export const dynamic = "force-dynamic";
++
++// GET /api/stats -> totals, clicks per day and top referrers.
++export async function GET() {
++  const db = await readDb();
++
++  return NextResponse.json({
++    totalLinks: Object.keys(db.links).length,
++    totalClicks: Object.values(db.links).reduce((sum, l) => sum + l.clicks, 0),
++    perDay: clicksPerDay(db.events),
++    topReferrers: topReferrers(db.events),
++    serverTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
++  });
++}
+diff --git a/app/globals.css b/app/globals.css
+new file mode 100644
+index 0000000..9517cf5
+--- /dev/null
++++ b/app/globals.css
+@@ -0,0 +1,226 @@
++:root {
++  --bg: #0b0d12;
++  --card: #141821;
++  --border: #252b38;
++  --text: #e8ebf2;
++  --muted: #8b93a7;
++  --accent: #4f8cff;
++  --ok: #34d399;
++  --danger: #f87171;
++}
++
++* {
++  box-sizing: border-box;
++}
++
++body {
++  margin: 0;
++  background: var(--bg);
++  color: var(--text);
++  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
++  line-height: 1.5;
++}
++
++a {
++  color: var(--accent);
++  text-decoration: none;
++}
++a:hover {
++  text-decoration: underline;
++}
++
++.wrap {
++  max-width: 880px;
++  margin: 0 auto;
++  padding: 32px 20px 64px;
++}
++
++.top h1 {
++  margin: 0;
++  font-size: 28px;
++  letter-spacing: -0.02em;
++}
++
++.muted {
++  color: var(--muted);
++  font-size: 14px;
++}
++
++.card {
++  background: var(--card);
++  border: 1px solid var(--border);
++  border-radius: 12px;
++  padding: 20px;
++  margin-top: 20px;
++}
++
++.card h2 {
++  margin: 0 0 12px;
++  font-size: 16px;
++}
++
++.card h3 {
++  margin: 20px 0 8px;
++  font-size: 13px;
++  color: var(--muted);
++  text-transform: uppercase;
++  letter-spacing: 0.06em;
++}
++
++.row {
++  display: flex;
++  gap: 8px;
++  flex-wrap: wrap;
++}
++
++input {
++  flex: 1 1 200px;
++  background: var(--bg);
++  border: 1px solid var(--border);
++  border-radius: 8px;
++  color: var(--text);
++  padding: 9px 12px;
++  font-size: 14px;
++}
++input:focus {
++  outline: 2px solid var(--accent);
++  outline-offset: -1px;
++}
++
++button {
++  background: var(--accent);
++  color: white;
++  border: 0;
++  border-radius: 8px;
++  padding: 9px 14px;
++  font-size: 14px;
++  cursor: pointer;
++}
++button:disabled {
++  opacity: 0.6;
++  cursor: default;
++}
++button.ghost {
++  background: transparent;
++  color: var(--muted);
++  border: 1px solid var(--border);
++  padding: 5px 10px;
++  margin-left: 6px;
++}
++button.ghost:hover {
++  color: var(--text);
++}
++button.danger:hover {
++  color: var(--danger);
++  border-color: var(--danger);
++}
++
++.ok {
++  color: var(--ok);
++  font-size: 14px;
++  margin: 10px 0 0;
++}
++.error {
++  color: var(--danger);
++  font-size: 14px;
++  margin: 10px 0 0;
++}
++
++table {
++  width: 100%;
++  border-collapse: collapse;
++  font-size: 14px;
++}
++th {
++  text-align: left;
++  color: var(--muted);
++  font-weight: 500;
++  padding: 6px 8px;
++  border-bottom: 1px solid var(--border);
++}
++td {
++  padding: 10px 8px;
++  border-bottom: 1px solid var(--border);
++  vertical-align: middle;
++}
++.num {
++  text-align: right;
++}
++.dest {
++  max-width: 320px;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++.actions {
++  text-align: right;
++  white-space: nowrap;
++}
++
++.tiles {
++  display: flex;
++  gap: 12px;
++  flex-wrap: wrap;
++}
++.tile {
++  flex: 1 1 140px;
++  background: var(--bg);
++  border: 1px solid var(--border);
++  border-radius: 10px;
++  padding: 12px 14px;
++  display: flex;
++  flex-direction: column;
++}
++.tile-value {
++  font-size: 26px;
++  font-weight: 600;
++}
++.tile-value.small {
++  font-size: 15px;
++  padding: 8px 0;
++}
++
++.bars {
++  display: flex;
++  align-items: flex-end;
++  gap: 10px;
++  height: 160px;
++  padding-top: 8px;
++}
++.bar-col {
++  flex: 1;
++  max-width: 64px;
++  height: 100%;
++  display: flex;
++  flex-direction: column;
++  justify-content: flex-end;
++  align-items: stretch;
++  text-align: center;
++}
++.bar {
++  background: var(--accent);
++  border-radius: 4px 4px 0 0;
++  min-height: 2px;
++}
++.bar-count {
++  font-size: 12px;
++  color: var(--muted);
++}
++.bar-label {
++  font-size: 11px;
++  color: var(--muted);
++  margin-top: 4px;
++}
++
++.referrers {
++  list-style: none;
++  padding: 0;
++  margin: 0;
++}
++.referrers li {
++  display: flex;
++  justify-content: space-between;
++  padding: 6px 0;
++  border-bottom: 1px solid var(--border);
++  font-size: 14px;
++}
+diff --git a/app/layout.tsx b/app/layout.tsx
+new file mode 100644
+index 0000000..18ab8a7
+--- /dev/null
++++ b/app/layout.tsx
+@@ -0,0 +1,19 @@
++import type { Metadata } from "next";
++import "./globals.css";
++
++export const metadata: Metadata = {
++  title: "Linkly",
++  description: "A tiny link shortener with click analytics",
++};
++
++export default function RootLayout({
++  children,
++}: {
++  children: React.ReactNode;
++}) {
++  return (
++    <html lang="en">
++      <body>{children}</body>
++    </html>
++  );
++}
+diff --git a/app/page.tsx b/app/page.tsx
+new file mode 100644
+index 0000000..f16ea5a
+--- /dev/null
++++ b/app/page.tsx
+@@ -0,0 +1,5 @@
++import Dashboard from "@/components/Dashboard";
++
++export default function Home() {
++  return <Dashboard />;
++}
+diff --git a/components/CreateForm.tsx b/components/CreateForm.tsx
+new file mode 100644
+index 0000000..eadd8d3
+--- /dev/null
++++ b/components/CreateForm.tsx
+@@ -0,0 +1,63 @@
++"use client";
++
++import { useState } from "react";
++
++export default function CreateForm({ onCreated }: { onCreated: () => void }) {
++  const [url, setUrl] = useState("");
++  const [slug, setSlug] = useState("");
++  const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(
++    null
++  );
++  const [busy, setBusy] = useState(false);
++
++  async function submit(e: React.FormEvent) {
++    e.preventDefault();
++    setBusy(true);
++    setMessage(null);
++
++    const res = await fetch("/api/links", {
++      method: "POST",
++      headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({ url, slug: slug || undefined }),
++    });
++    const json = await res.json();
++    setBusy(false);
++
++    if (!res.ok) {
++      setMessage({ ok: false, text: json.error ?? "Something went wrong" });
++      return;
++    }
++
++    setMessage({ ok: true, text: `Created /${json.link.slug}` });
++    setUrl("");
++    setSlug("");
++    onCreated();
++  }
++
++  return (
++    <form className="card form" onSubmit={submit}>
++      <h2>New short link</h2>
++      <div className="row">
++        <input
++          value={url}
++          onChange={(e) => setUrl(e.target.value)}
++          placeholder="Destination URL (https://...)"
++          aria-label="Destination URL"
++          required
++        />
++        <input
++          value={slug}
++          onChange={(e) => setSlug(e.target.value)}
++          placeholder="Custom slug (optional)"
++          aria-label="Custom slug"
++        />
++        <button type="submit" disabled={busy}>
++          {busy ? "Creating..." : "Create"}
++        </button>
++      </div>
++      {message && (
++        <p className={message.ok ? "ok" : "error"}>{message.text}</p>
++      )}
++    </form>
++  );
++}
+diff --git a/components/Dashboard.tsx b/components/Dashboard.tsx
+new file mode 100644
+index 0000000..6beddcb
+--- /dev/null
++++ b/components/Dashboard.tsx
+@@ -0,0 +1,58 @@
++"use client";
++
++import { useCallback, useEffect, useState } from "react";
++import CreateForm from "./CreateForm";
++import LinkTable from "./LinkTable";
++import StatsPanel from "./StatsPanel";
++import type { LinkRecord } from "@/lib/store";
++import type { DayBucket, ReferrerBucket } from "@/lib/stats";
++
++export interface Stats {
++  totalLinks: number;
++  totalClicks: number;
++  perDay: DayBucket[];
++  topReferrers: ReferrerBucket[];
++  serverTimezone: string;
++}
++
++export default function Dashboard() {
++  const [links, setLinks] = useState<LinkRecord[]>([]);
++  const [stats, setStats] = useState<Stats | null>(null);
++  const [error, setError] = useState<string | null>(null);
++
++  // Pull the latest links and stats from the API.
++  const refresh = useCallback(async () => {
++    try {
++      const [linksRes, statsRes] = await Promise.all([
++        fetch("/api/links", { cache: "no-store" }),
++        fetch("/api/stats", { cache: "no-store" }),
++      ]);
++      const linksJson = await linksRes.json();
++      const statsJson = await statsRes.json();
++      setLinks(linksJson.links);
++      setStats(statsJson);
++      setError(null);
++    } catch {
++      setError("Could not load data from the API.");
++    }
++  }, []);
++
++  useEffect(() => {
++    refresh();
++  }, [refresh]);
++
++  return (
++    <main className="wrap">
++      <header className="top">
++        <h1>Linkly</h1>
++        <p className="muted">Short links with click analytics</p>
++      </header>
++
++      {error && <p className="error">{error}</p>}
++
++      <CreateForm onCreated={refresh} />
++      <StatsPanel stats={stats} />
++      <LinkTable links={links} onChanged={refresh} />
++    </main>
++  );
++}
+diff --git a/components/LinkTable.tsx b/components/LinkTable.tsx
+new file mode 100644
+index 0000000..d322451
+--- /dev/null
++++ b/components/LinkTable.tsx
+@@ -0,0 +1,111 @@
++"use client";
++
++import { useState } from "react";
++import type { LinkRecord } from "@/lib/store";
++
++export default function LinkTable({
++  links,
++  onChanged,
++}: {
++  links: LinkRecord[];
++  onChanged: () => void;
++}) {
++  const [editing, setEditing] = useState<string | null>(null);
++  const [draft, setDraft] = useState("");
++  const [error, setError] = useState<string | null>(null);
++
++  async function save(slug: string) {
++    setError(null);
++    const res = await fetch(`/api/links/${slug}`, {
++      method: "PATCH",
++      headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({ url: draft }),
++    });
++    if (!res.ok) {
++      const json = await res.json();
++      setError(json.error ?? "Could not update the link");
++      return;
++    }
++    setEditing(null);
++    onChanged();
++  }
++
++  async function remove(slug: string) {
++    await fetch(`/api/links/${slug}`, { method: "DELETE" });
++    onChanged();
++  }
++
++  return (
++    <section className="card">
++      <h2>Your links</h2>
++      {error && <p className="error">{error}</p>}
++      {links.length === 0 ? (
++        <p className="muted">No links yet. Create one above.</p>
++      ) : (
++        <table>
++          <thead>
++            <tr>
++              <th>Short link</th>
++              <th>Destination</th>
++              <th className="num">Clicks</th>
++              <th />
++            </tr>
++          </thead>
++          <tbody>
++            {links.map((link) => (
++              <tr key={link.slug}>
++                <td>
++                  <a href={`/${link.slug}`} target="_blank" rel="noreferrer">
++                    /{link.slug}
++                  </a>
++                </td>
++                <td className="dest">
++                  {editing === link.slug ? (
++                    <input
++                      value={draft}
++                      onChange={(e) => setDraft(e.target.value)}
++                      aria-label={`New destination for ${link.slug}`}
++                    />
++                  ) : (
++                    <a href={link.url} target="_blank" rel="noreferrer">
++                      {link.url}
++                    </a>
++                  )}
++                </td>
++                <td className="num">{link.clicks}</td>
++                <td className="actions">
++                  {editing === link.slug ? (
++                    <>
++                      <button onClick={() => save(link.slug)}>Save</button>
++                      <button className="ghost" onClick={() => setEditing(null)}>
++                        Cancel
++                      </button>
++                    </>
++                  ) : (
++                    <>
++                      <button
++                        className="ghost"
++                        onClick={() => {
++                          setEditing(link.slug);
++                          setDraft(link.url);
++                        }}
++                      >
++                        Edit
++                      </button>
++                      <button
++                        className="ghost danger"
++                        onClick={() => remove(link.slug)}
++                      >
++                        Delete
++                      </button>
++                    </>
++                  )}
++                </td>
++              </tr>
++            ))}
++          </tbody>
++        </table>
++      )}
++    </section>
++  );
++}
+diff --git a/components/StatsPanel.tsx b/components/StatsPanel.tsx
+new file mode 100644
+index 0000000..d56468b
+--- /dev/null
++++ b/components/StatsPanel.tsx
+@@ -0,0 +1,69 @@
++"use client";
++
++import type { Stats } from "./Dashboard";
++
++export default function StatsPanel({ stats }: { stats: Stats | null }) {
++  if (!stats) {
++    return (
++      <section className="card">
++        <h2>Analytics</h2>
++        <p className="muted">Loading...</p>
++      </section>
++    );
++  }
++
++  const max = Math.max(1, ...stats.perDay.map((d) => d.clicks));
++
++  return (
++    <section className="card">
++      <h2>Analytics</h2>
++
++      <div className="tiles">
++        <div className="tile">
++          <span className="tile-value">{stats.totalLinks}</span>
++          <span className="muted">links</span>
++        </div>
++        <div className="tile">
++          <span className="tile-value">{stats.totalClicks}</span>
++          <span className="muted">total clicks</span>
++        </div>
++        <div className="tile">
++          <span className="tile-value small">{stats.serverTimezone}</span>
++          <span className="muted">server timezone</span>
++        </div>
++      </div>
++
++      <h3>Clicks per day</h3>
++      {stats.perDay.length === 0 ? (
++        <p className="muted">No clicks recorded yet.</p>
++      ) : (
++        <div className="bars">
++          {stats.perDay.map((d) => (
++            <div className="bar-col" key={d.day} title={`${d.day}: ${d.clicks}`}>
++              <span className="bar-count">{d.clicks}</span>
++              <div
++                className="bar"
++                style={{ height: `${Math.round((d.clicks / max) * 100)}%` }}
++              />
++              <span className="bar-label">{d.day.slice(5)}</span>
++            </div>
++          ))}
++        </div>
++      )}
++
++      <h3>Top referrers</h3>
++      {stats.topReferrers.length === 0 ? (
++        <p className="muted">Nothing yet.</p>
++      ) : (
++        <ul className="referrers">
++          {stats.topReferrers.map((r) => (
++            <li key={r.referrer}>
++              <span>{r.referrer}</span>
++              <span className="muted">{r.clicks}</span>
++            </li>
++          ))}
++        </ul>
++      )}
++    </section>
++  );
++}
+diff --git a/lib/slug.ts b/lib/slug.ts
+new file mode 100644
+index 0000000..45fa35d
+--- /dev/null
++++ b/lib/slug.ts
+@@ -0,0 +1,4 @@
++// Short random slug, e.g. "k3f". Three base-36 characters keeps URLs tiny.
++export function generateSlug(): string {
++  return Math.random().toString(36).slice(2, 5);
++}
+diff --git a/lib/stats.ts b/lib/stats.ts
+new file mode 100644
+index 0000000..5311098
+--- /dev/null
++++ b/lib/stats.ts
+@@ -0,0 +1,51 @@
++import type { ClickEvent } from "./store";
++
++export interface DayBucket {
++  day: string; // YYYY-MM-DD
++  clicks: number;
++}
++
++export interface ReferrerBucket {
++  referrer: string;
++  clicks: number;
++}
++
++// Group click events into one bucket per calendar day.
++export function clicksPerDay(events: ClickEvent[]): DayBucket[] {
++  const buckets = new Map<string, number>();
++
++  for (const event of events) {
++    const d = new Date(event.ts);
++    const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(
++      2,
++      "0"
++    )}-${String(d.getDate()).padStart(2, "0")}`;
++    buckets.set(day, (buckets.get(day) ?? 0) + 1);
++  }
++
++  return [...buckets.entries()]
++    .sort(([a], [b]) => a.localeCompare(b))
++    .map(([day, clicks]) => ({ day, clicks }));
++}
++
++// Count clicks per referring hostname. No referrer header means "direct".
++export function topReferrers(events: ClickEvent[], limit = 5): ReferrerBucket[] {
++  const counts = new Map<string, number>();
++
++  for (const event of events) {
++    let referrer = "direct";
++    if (event.referrer) {
++      try {
++        referrer = new URL(event.referrer).hostname;
++      } catch {
++        referrer = "unknown";
++      }
++    }
++    counts.set(referrer, (counts.get(referrer) ?? 0) + 1);
++  }
++
++  return [...counts.entries()]
++    .sort((a, b) => b[1] - a[1])
++    .slice(0, limit)
++    .map(([referrer, clicks]) => ({ referrer, clicks }));
++}
+diff --git a/lib/store.ts b/lib/store.ts
+new file mode 100644
+index 0000000..d688a0b
+--- /dev/null
++++ b/lib/store.ts
+@@ -0,0 +1,49 @@
++import { promises as fs } from "fs";
++import path from "path";
++
++export interface LinkRecord {
++  slug: string;
++  url: string;
++  createdAt: string; // ISO 8601, always UTC
++  clicks: number;
++}
++
++export interface ClickEvent {
++  slug: string;
++  ts: string; // ISO 8601, always UTC
++  referrer: string | null;
++}
++
++export interface Db {
++  links: Record<string, LinkRecord>;
++  events: ClickEvent[];
++}
++
++const DB_PATH = path.join(process.cwd(), "data", "db.json");
++
++// Read the whole database file. If it doesn't exist yet we start empty.
++export async function readDb(): Promise<Db> {
++  try {
++    const raw = await fs.readFile(DB_PATH, "utf8");
++    const db = JSON.parse(raw) as Db;
++    // A null-prototype map, so a slug like "constructor" is just a normal key.
++    db.links = Object.assign(Object.create(null), db.links);
++    return db;
++  } catch (err) {
++    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
++      return { links: Object.create(null), events: [] };
++    }
++    throw err;
++  }
++}
++
++// Write the whole database file. We write to a temp file and rename it so a
++// reader never sees a half-written file.
++export async function writeDb(db: Db): Promise<void> {
++  await fs.mkdir(path.dirname(DB_PATH), { recursive: true });
++  const tmp = `${DB_PATH}.${process.pid}.${Date.now()}.${Math.random()
++    .toString(36)
++    .slice(2)}.tmp`;
++  await fs.writeFile(tmp, JSON.stringify(db, null, 2), "utf8");
++  await fs.rename(tmp, DB_PATH);
++}
+diff --git a/next.config.ts b/next.config.ts
+new file mode 100644
+index 0000000..cb651cd
+--- /dev/null
++++ b/next.config.ts
+@@ -0,0 +1,5 @@
++import type { NextConfig } from "next";
++
++const nextConfig: NextConfig = {};
++
++export default nextConfig;
+diff --git a/package.json b/package.json
+new file mode 100644
+index 0000000..3f5c6ce
+--- /dev/null
++++ b/package.json
+@@ -0,0 +1,26 @@
++{
++  "name": "linkly",
++  "version": "0.1.0",
++  "private": true,
++  "scripts": {
++    "dev": "next dev",
++    "dev:la": "TZ=America/Los_Angeles next dev",
++    "build": "next build",
++    "start": "next start",
++    "seed": "node scripts/seed.mjs",
++    "hammer": "node scripts/hammer.mjs",
++    "collide": "node scripts/collide.mjs",
++    "stats": "node scripts/stats.mjs"
++  },
++  "dependencies": {
++    "next": "16.4.3",
++    "react": "19.3.1",
++    "react-dom": "19.3.1"
++  },
++  "devDependencies": {
++    "@types/node": "22.20.5",
++    "@types/react": "19.3.0",
++    "@types/react-dom": "19.3.0",
++    "typescript": "5.9.3"
++  }
++}
+diff --git a/scripts/collide.mjs b/scripts/collide.mjs
+new file mode 100644
+index 0000000..f9fbf32
+--- /dev/null
++++ b/scripts/collide.mjs
+@@ -0,0 +1,74 @@
++// Checks that creating links never silently replaces an existing link.
++// Usage: npm run collide
++const BASE = process.env.BASE ?? "http://localhost:3000";
++
++async function post(body) {
++  const res = await fetch(`${BASE}/api/links`, {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify(body),
++  });
++  return { status: res.status, json: await res.json() };
++}
++
++async function destination(slug) {
++  const res = await fetch(`${BASE}/api/links`, { cache: "no-store" });
++  const { links } = await res.json();
++  return links.find((l) => l.slug === slug)?.url ?? null;
++}
++
++let failed = false;
++
++// Part A: ask for the same custom slug twice.
++console.log("Part A: same custom slug, two different destinations");
++const first = await post({ url: "https://example.com/first", slug: "collide-test" });
++const second = await post({ url: "https://example.com/second", slug: "collide-test" });
++console.log(`  first  -> ${first.status}`);
++console.log(`  second -> ${second.status}`);
++console.log(`  /collide-test now points at: ${await destination("collide-test")}`);
++
++if (second.status === 201) {
++  console.log("  FAIL: the second request silently replaced the first link.");
++  failed = true;
++} else {
++  console.log("  PASS: the second request was refused.");
++}
++
++// Part B: create lots of random-slug links and look for repeated slugs.
++const COUNT = 600;
++console.log(`\nPart B: creating ${COUNT} links with random slugs`);
++const seen = new Map();
++const created = [];
++let duplicates = 0;
++
++for (let i = 0; i < COUNT; i++) {
++  const { status, json } = await post({ url: `https://example.com/page-${i}` });
++  if (status !== 201) {
++    console.log(`  unexpected status ${status}: ${JSON.stringify(json)}`);
++    failed = true;
++    break;
++  }
++  const slug = json.link.slug;
++  if (seen.has(slug)) {
++    duplicates += 1;
++    console.log(`  duplicate slug "${slug}" (page-${seen.get(slug)} was overwritten by page-${i})`);
++  } else {
++    created.push(slug);
++  }
++  seen.set(slug, i);
++}
++
++if (duplicates > 0) {
++  console.log(`  FAIL: ${duplicates} links were overwritten by a slug collision.`);
++  failed = true;
++} else {
++  console.log("  PASS: no collisions.");
++}
++
++// Clean up everything this script created.
++for (const slug of [...created, "collide-test"]) {
++  await fetch(`${BASE}/api/links/${slug}`, { method: "DELETE" });
++}
++console.log("\nCleaned up test links.");
++
++process.exit(failed ? 1 : 0);
+diff --git a/scripts/hammer.mjs b/scripts/hammer.mjs
+new file mode 100644
+index 0000000..77208e9
+--- /dev/null
++++ b/scripts/hammer.mjs
+@@ -0,0 +1,40 @@
++// Fires N simultaneous visits at one short link and checks that the click
++// counter went up by exactly N.
++// Usage: npm run hammer            (50 hits on /docs)
++//        node scripts/hammer.mjs gh 100
++const BASE = process.env.BASE ?? "http://localhost:3000";
++const slug = process.argv[2] ?? "docs";
++const hits = Number(process.argv[3] ?? 50);
++
++async function getClicks() {
++  const res = await fetch(`${BASE}/api/links`, { cache: "no-store" });
++  const { links } = await res.json();
++  const link = links.find((l) => l.slug === slug);
++  if (!link) throw new Error(`No link with slug "${slug}". Run: npm run seed`);
++  return link.clicks;
++}
++
++// Warm-up request so the dev server finishes compiling the route first.
++await fetch(`${BASE}/${slug}`, { redirect: "manual" });
++
++const before = await getClicks();
++
++await Promise.all(
++  Array.from({ length: hits }, () =>
++    fetch(`${BASE}/${slug}`, { redirect: "manual" })
++  )
++);
++
++const after = await getClicks();
++const recorded = after - before;
++const lost = hits - recorded;
++
++console.log(`Sent ${hits} visits to /${slug}`);
++console.log(`Counter went from ${before} to ${after} (+${recorded})`);
++
++if (lost === 0) {
++  console.log("PASS: every click was counted.");
++} else {
++  console.log(`FAIL: ${lost} clicks were lost.`);
++  process.exit(1);
++}
+diff --git a/scripts/seed.mjs b/scripts/seed.mjs
+new file mode 100644
+index 0000000..156504a
+--- /dev/null
++++ b/scripts/seed.mjs
+@@ -0,0 +1,62 @@
++// Resets data/db.json to a known demo state.
++// Usage: npm run seed
++import { mkdir, writeFile } from "node:fs/promises";
++import path from "node:path";
++
++const DB_PATH = path.join(process.cwd(), "data", "db.json");
++
++const links = {
++  docs: {
++    slug: "docs",
++    url: "https://nextjs.org/docs",
++    createdAt: "2026-10-18T09:00:00.000Z",
++    clicks: 0,
++  },
++  promo: {
++    slug: "promo",
++    url: "https://example.com/spring-sale",
++    createdAt: "2026-10-19T12:30:00.000Z",
++    clicks: 0,
++  },
++  gh: {
++    slug: "gh",
++    url: "https://github.com",
++    createdAt: "2026-10-20T15:45:00.000Z",
++    clicks: 0,
++  },
++};
++
++// [ISO timestamp, slug, referrer]
++const rows = [
++  ["2026-10-21T10:15:00Z", "docs", "https://news.ycombinator.com/"],
++  ["2026-10-21T14:02:00Z", "docs", "https://twitter.com/"],
++  ["2026-10-21T18:40:00Z", "promo", null],
++  ["2026-10-22T08:10:00Z", "docs", "https://news.ycombinator.com/"],
++  ["2026-10-22T09:20:00Z", "gh", null],
++  ["2026-10-22T11:55:00Z", "promo", "https://mail.google.com/"],
++  ["2026-10-22T16:30:00Z", "docs", "https://twitter.com/"],
++  ["2026-10-23T07:45:00Z", "gh", "https://www.linkedin.com/"],
++  ["2026-10-23T13:05:00Z", "docs", null],
++  ["2026-10-23T19:25:00Z", "promo", "https://mail.google.com/"],
++  // These five clicks sit right around midnight UTC. Which calendar day
++  // they belong to depends on the timezone you ask the question in.
++  ["2026-10-24T23:10:00Z", "docs", "https://news.ycombinator.com/"],
++  ["2026-10-24T23:30:00Z", "promo", "https://twitter.com/"],
++  ["2026-10-24T23:50:00Z", "docs", null],
++  ["2026-10-25T00:20:00Z", "gh", "https://www.linkedin.com/"],
++  ["2026-10-25T00:40:00Z", "docs", "https://news.ycombinator.com/"],
++  ["2026-10-25T09:00:00Z", "promo", "https://mail.google.com/"],
++  ["2026-10-25T15:15:00Z", "docs", null],
++];
++
++const events = rows.map(([ts, slug, referrer]) => {
++  links[slug].clicks += 1;
++  return { slug, ts, referrer };
++});
++
++await mkdir(path.dirname(DB_PATH), { recursive: true });
++await writeFile(DB_PATH, JSON.stringify({ links, events }, null, 2));
++
++console.log(
++  `Seeded ${Object.keys(links).length} links and ${events.length} click events -> ${DB_PATH}`
++);
+diff --git a/scripts/stats.mjs b/scripts/stats.mjs
+new file mode 100644
+index 0000000..f8704f2
+--- /dev/null
++++ b/scripts/stats.mjs
+@@ -0,0 +1,18 @@
++// Prints /api/stats in a readable way.
++// Usage: npm run stats
++const BASE = process.env.BASE ?? "http://localhost:3000";
++
++const res = await fetch(`${BASE}/api/stats`, { cache: "no-store" });
++const stats = await res.json();
++
++console.log(`Server timezone : ${stats.serverTimezone}`);
++console.log(`Total links     : ${stats.totalLinks}`);
++console.log(`Total clicks    : ${stats.totalClicks}`);
++console.log("\nClicks per day:");
++for (const { day, clicks } of stats.perDay) {
++  console.log(`  ${day}  ${"#".repeat(clicks)} ${clicks}`);
++}
++console.log("\nTop referrers:");
++for (const { referrer, clicks } of stats.topReferrers) {
++  console.log(`  ${referrer.padEnd(24)} ${clicks}`);
++}
+diff --git a/tsconfig.json b/tsconfig.json
+new file mode 100644
+index 0000000..3f0b70d
+--- /dev/null
++++ b/tsconfig.json
+@@ -0,0 +1,41 @@
++{
++  "compilerOptions": {
++    "target": "ES2017",
++    "lib": [
++      "dom",
++      "dom.iterable",
++      "esnext"
++    ],
++    "allowJs": false,
++    "skipLibCheck": true,
++    "strict": true,
++    "noEmit": true,
++    "esModuleInterop": true,
++    "module": "esnext",
++    "moduleResolution": "bundler",
++    "resolveJsonModule": true,
++    "isolatedModules": true,
++    "jsx": "react-jsx",
++    "incremental": true,
++    "plugins": [
++      {
++        "name": "next"
++      }
++    ],
++    "paths": {
++      "@/*": [
++        "./*"
++      ]
++    }
++  },
++  "include": [
++    "next-env.d.ts",
++    "**/*.ts",
++    "**/*.tsx",
++    ".next/types/**/*.ts",
++    ".next/dev/types/**/*.ts"
++  ],
++  "exclude": [
++    "node_modules"
++  ]
++}
